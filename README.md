@@ -1,4 +1,4 @@
-# Spyfall Game (Made by AI (antigravity))
+# Spyfall Game (Made by Antigravity)
 
 ## How to Run
 

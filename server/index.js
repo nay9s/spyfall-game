@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -5,385 +6,545 @@ const cors = require('cors');
 const { locations } = require('./gameData');
 
 const app = express();
-// Allow CORS from the client URL (deployed) or localhost (dev)
-let CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
-// Strip trailing slash if present
-if (CLIENT_URL.endsWith('/')) {
-    CLIENT_URL = CLIENT_URL.slice(0, -1);
-}
+
+let CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+if (CLIENT_URL.endsWith('/')) CLIENT_URL = CLIENT_URL.slice(0, -1);
 
 const corsOptions = {
-    origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl requests)
-        if (!origin) return callback(null, true);
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
 
-        // Allow any vercel.app domain
-        if (origin.endsWith('.vercel.app')) {
-            return callback(null, true);
-        }
+    if (
+      origin.endsWith('.vercel.app') ||
+      origin.includes('localhost') ||
+      origin.includes('127.0.0.1') ||
+      origin.startsWith('http://192.168.') ||
+      origin.startsWith('http://10.') ||
+      (CLIENT_URL && origin === CLIENT_URL)
+    ) {
+      return callback(null, true);
+    }
 
-        // Allow localhost and local network IPs
-        if (origin.includes('localhost') ||
-            origin.includes('127.0.0.1') ||
-            origin.startsWith('http://192.168.') ||
-            origin.startsWith('http://10.')) {
-            return callback(null, true);
-        }
-
-        // Check against specific CLIENT_URL if set
-        if (CLIENT_URL && origin === CLIENT_URL) {
-            return callback(null, true);
-        }
-
-        console.log('Blocked by CORS:', origin);
-        callback(new Error('Not allowed by CORS'));
-    },
-    methods: ["GET", "POST"],
-    credentials: true
+    console.log('Blocked by CORS:', origin);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST'],
+  credentials: true,
 };
 
 app.use(cors(corsOptions));
-
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: corsOptions
+app.get('/', (_req, res) => {
+  res.json({ status: 'ok', game: 'spyfall', locations: locations.length });
 });
 
-// State
-const rooms = new Map(); // roomId -> { players: [], status: 'waiting'|'playing', location: null, startTime: null, gameLength: 8 }
+const server = http.createServer(app);
+const io = new Server(server, { cors: corsOptions });
 
-function generateRoomId() {
-    return Math.random().toString(36).substring(2, 8).toUpperCase();
+const rooms = new Map();
+const GAME_LENGTHS = new Set([3, 5, 8, 10]);
+const MIN_PLAYERS = 3;
+const MAX_PLAYERS = 12;
+const RECONNECT_GRACE_MS = 2 * 60 * 1000;
+
+function normalizeRoomId(roomId) {
+  return String(roomId || '').trim().toUpperCase();
 }
 
-// Helper to sanitize player data (remove sensitive info like roles and internal objects like timeouts)
+function normalizeName(name) {
+  return String(name || '').trim().replace(/\s+/g, ' ').slice(0, 24);
+}
+
+function generateRoomId() {
+  let roomId;
+  do {
+    roomId = Math.random().toString(36).slice(2, 8).toUpperCase();
+  } while (rooms.has(roomId));
+  return roomId;
+}
+
+function generateSessionToken() {
+  return crypto.randomBytes(18).toString('hex');
+}
+
+function emitError(socket, message) {
+  socket.emit('game_error', message);
+}
+
+function clearRoomTimer(room) {
+  if (room.timer) {
+    clearTimeout(room.timer);
+    room.timer = null;
+  }
+}
+
 function getPublicPlayerList(players) {
-    return players.map(p => ({
-        id: p.id,
-        name: p.name,
-        isHost: p.isHost,
-        connected: p.connected
-    }));
+  return players.map((player) => ({
+    id: player.id,
+    name: player.name,
+    isHost: player.isHost,
+    connected: player.connected,
+  }));
+}
+
+function getConnectedPlayers(room) {
+  return room.players.filter((player) => player.connected);
+}
+
+function ensureHost(room) {
+  const connectedHost = room.players.find((player) => player.isHost && player.connected);
+  if (connectedHost) return connectedHost;
+
+  const nextHost = room.players.find((player) => player.connected);
+  if (!nextHost) return null;
+
+  room.players.forEach((player) => {
+    player.isHost = player === nextHost;
+  });
+  return nextHost;
+}
+
+function buildGameState(room, player) {
+  if (room.status === 'waiting') return null;
+
+  const isSpy = player.id === room.spyId;
+  const isFinished = room.status === 'finished';
+  const totalSeconds = room.gameLength * 60;
+  const elapsedSeconds = room.startTime ? (Date.now() - room.startTime) / 1000 : 0;
+  const remainingTime = room.status === 'playing'
+    ? Math.max(0, Math.floor(totalSeconds - elapsedSeconds))
+    : 0;
+
+  return {
+    status: room.status,
+    location: isFinished || !isSpy ? room.location?.name : '???',
+    role: player.role,
+    isSpy,
+    startTime: room.startTime,
+    gameLength: totalSeconds,
+    remainingTime,
+    allLocations: locations.map((location) => location.name),
+    result: room.result || null,
+    hasVoted: Boolean(room.votes[player.id]),
+  };
+}
+
+function emitRoomJoined(socket, room, player) {
+  socket.emit('room_joined', {
+    roomId: room.id,
+    players: getPublicPlayerList(room.players),
+    isHost: player.isHost,
+    gameLength: room.gameLength,
+    isPublic: room.isPublic,
+    sessionToken: player.sessionToken,
+    gameState: buildGameState(room, player),
+  });
+}
+
+function finishGame(room, winner, reason) {
+  if (room.status === 'finished') return;
+
+  clearRoomTimer(room);
+  room.status = 'finished';
+  const spy = room.players.find((player) => player.id === room.spyId);
+  room.result = {
+    winner,
+    reason,
+    location: room.location?.name || '',
+    spyName: spy?.name || 'Unknown',
+  };
+  io.to(room.id).emit('game_over', room.result);
+}
+
+function maybeResolveVoting(room) {
+  if (room.status !== 'voting') return;
+
+  const connectedPlayers = getConnectedPlayers(room);
+  if (connectedPlayers.length === 0) return;
+
+  const activeIds = new Set(connectedPlayers.map((player) => player.id));
+  const validVotes = Object.entries(room.votes).filter(
+    ([voterId, suspectId]) => activeIds.has(voterId) && activeIds.has(suspectId),
+  );
+
+  if (validVotes.length < connectedPlayers.length) return;
+
+  const voteCounts = {};
+  validVotes.forEach(([, suspectId]) => {
+    voteCounts[suspectId] = (voteCounts[suspectId] || 0) + 1;
+  });
+
+  const maxVotes = Math.max(...Object.values(voteCounts));
+  const leaders = Object.entries(voteCounts)
+    .filter(([, count]) => count === maxVotes)
+    .map(([id]) => id);
+
+  if (leaders.length !== 1) {
+    finishGame(room, 'spy', `ผลโหวตเสมอ Spy รอด! สถานที่คือ ${room.location.name}`);
+    return;
+  }
+
+  if (leaders[0] === room.spyId) {
+    room.status = 'guessing';
+    io.to(room.id).emit('spy_guess_phase');
+    return;
+  }
+
+  const suspect = room.players.find((player) => player.id === leaders[0]);
+  finishGame(
+    room,
+    'spy',
+    `โหวตผิดคน (${suspect?.name || 'Unknown'}) — Spy ชนะ! สถานที่คือ ${room.location.name}`,
+  );
+}
+
+function removePlayer(room, player) {
+  if (player.disconnectTimeout) {
+    clearTimeout(player.disconnectTimeout);
+    delete player.disconnectTimeout;
+  }
+
+  const index = room.players.indexOf(player);
+  if (index !== -1) room.players.splice(index, 1);
+
+  delete room.votes[player.id];
+  for (const [voterId, suspectId] of Object.entries(room.votes)) {
+    if (suspectId === player.id) delete room.votes[voterId];
+  }
+
+  ensureHost(room);
 }
 
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+  console.log('User connected:', socket.id);
 
-    socket.on('create_room', ({ playerName, isPublic }) => {
-        const roomId = generateRoomId();
-        // Default to private if not specified
-        const publicRoom = typeof isPublic === 'boolean' ? isPublic : false;
+  socket.on('create_room', ({ playerName, isPublic } = {}) => {
+    const name = normalizeName(playerName);
+    if (!name) return emitError(socket, 'กรุณาใส่ชื่อ');
 
-        rooms.set(roomId, {
-            id: roomId,
-            players: [{ id: socket.id, name: playerName, isHost: true, connected: true }],
-            status: 'waiting',
-            gameLength: 5, // minutes
-            location: null,
-            startTime: null,
-            votes: {}, // voterId -> suspectId
-            spyId: null,
-            timer: null,
-            isPublic: publicRoom
-        });
-        socket.join(roomId);
-        socket.emit('room_joined', {
-            roomId,
-            players: getPublicPlayerList(rooms.get(roomId).players),
-            isHost: true,
-            gameLength: 5,
-            isPublic: publicRoom
-        });
-        console.log(`Room ${roomId} created by ${playerName}`);
+    const roomId = generateRoomId();
+    const player = {
+      id: socket.id,
+      name,
+      isHost: true,
+      connected: true,
+      sessionToken: generateSessionToken(),
+    };
+
+    const room = {
+      id: roomId,
+      players: [player],
+      status: 'waiting',
+      gameLength: 5,
+      location: null,
+      startTime: null,
+      votes: {},
+      spyId: null,
+      timer: null,
+      isPublic: typeof isPublic === 'boolean' ? isPublic : false,
+      result: null,
+    };
+
+    rooms.set(roomId, room);
+    socket.join(roomId);
+    emitRoomJoined(socket, room, player);
+    console.log(`Room ${roomId} created by ${name}`);
+  });
+
+  socket.on('join_room', ({ roomId, playerName, sessionToken } = {}) => {
+    const normalizedRoomId = normalizeRoomId(roomId);
+    const name = normalizeName(playerName);
+    const room = rooms.get(normalizedRoomId);
+
+    if (!name) return emitError(socket, 'กรุณาใส่ชื่อ');
+    if (!room) return emitError(socket, 'ไม่พบห้องนี้');
+
+    const existingPlayer = room.players.find(
+      (player) => player.name.toLocaleLowerCase() === name.toLocaleLowerCase(),
+    );
+
+    if (existingPlayer) {
+      const tokenMatches = Boolean(sessionToken) && sessionToken === existingPlayer.sessionToken;
+      if (existingPlayer.connected && !tokenMatches) {
+        return emitError(socket, 'ชื่อนี้มีคนใช้แล้วในห้องนี้');
+      }
+      if (sessionToken && !tokenMatches) {
+        return emitError(socket, 'เซสชันเดิมไม่ถูกต้อง กรุณาใช้ชื่ออื่นหรือรอให้ผู้เล่นเดิมออกจากห้อง');
+      }
+
+      const oldId = existingPlayer.id;
+      if (oldId !== socket.id) {
+        const oldSocket = io.sockets.sockets.get(oldId);
+        if (oldSocket) oldSocket.leave(normalizedRoomId);
+
+        if (room.spyId === oldId) room.spyId = socket.id;
+
+        if (room.votes[oldId]) {
+          room.votes[socket.id] = room.votes[oldId];
+          delete room.votes[oldId];
+        }
+        for (const [voterId, suspectId] of Object.entries(room.votes)) {
+          if (suspectId === oldId) room.votes[voterId] = socket.id;
+        }
+      }
+
+      existingPlayer.id = socket.id;
+      existingPlayer.name = name;
+      existingPlayer.connected = true;
+      if (existingPlayer.disconnectTimeout) {
+        clearTimeout(existingPlayer.disconnectTimeout);
+        delete existingPlayer.disconnectTimeout;
+      }
+
+      ensureHost(room);
+      socket.join(normalizedRoomId);
+      emitRoomJoined(socket, room, existingPlayer);
+      io.to(normalizedRoomId).emit('player_update', getPublicPlayerList(room.players));
+      return;
+    }
+
+    if (room.status !== 'waiting') return emitError(socket, 'เกมเริ่มไปแล้ว');
+    if (room.players.length >= MAX_PLAYERS) return emitError(socket, `ห้องเต็มแล้ว (สูงสุด ${MAX_PLAYERS} คน)`);
+
+    const player = {
+      id: socket.id,
+      name,
+      isHost: false,
+      connected: true,
+      sessionToken: generateSessionToken(),
+    };
+
+    room.players.push(player);
+    ensureHost(room);
+    socket.join(normalizedRoomId);
+
+    io.to(normalizedRoomId).emit('player_update', getPublicPlayerList(room.players));
+    emitRoomJoined(socket, room, player);
+    console.log(`${name} joined room ${normalizedRoomId}`);
+  });
+
+  socket.on('update_game_settings', ({ roomId, gameLength, isPublic } = {}) => {
+    const room = rooms.get(normalizeRoomId(roomId));
+    if (!room || room.status !== 'waiting') return;
+
+    const player = room.players.find((item) => item.id === socket.id);
+    if (!player?.isHost) return emitError(socket, 'เฉพาะหัวหน้าห้องเท่านั้นที่แก้การตั้งค่าได้');
+
+    if (gameLength !== undefined) {
+      const normalizedLength = Number(gameLength);
+      if (!GAME_LENGTHS.has(normalizedLength)) return emitError(socket, 'เวลาเล่นไม่ถูกต้อง');
+      room.gameLength = normalizedLength;
+    }
+    if (typeof isPublic === 'boolean') room.isPublic = isPublic;
+
+    io.to(room.id).emit('game_settings_updated', {
+      gameLength: room.gameLength,
+      isPublic: room.isPublic,
+    });
+  });
+
+  socket.on('start_game', (roomId) => {
+    const room = rooms.get(normalizeRoomId(roomId));
+    if (!room) return emitError(socket, 'ไม่พบห้องนี้');
+    if (room.status !== 'waiting') return emitError(socket, 'เกมกำลังดำเนินอยู่');
+
+    const host = room.players.find((player) => player.id === socket.id);
+    if (!host?.isHost) return emitError(socket, 'เฉพาะหัวหน้าห้องเท่านั้นที่เริ่มเกมได้');
+
+    const connectedPlayers = getConnectedPlayers(room);
+    if (connectedPlayers.length < MIN_PLAYERS) {
+      return emitError(socket, `ต้องมีผู้เล่นอย่างน้อย ${MIN_PLAYERS} คน`);
+    }
+
+    room.players
+      .filter((player) => !player.connected)
+      .forEach((player) => {
+        if (player.disconnectTimeout) clearTimeout(player.disconnectTimeout);
+      });
+    room.players = connectedPlayers;
+
+    const location = locations[Math.floor(Math.random() * locations.length)];
+    room.location = location;
+    room.status = 'playing';
+    room.startTime = Date.now();
+    room.votes = {};
+    room.result = null;
+
+    const spyIndex = Math.floor(Math.random() * room.players.length);
+    room.spyId = room.players[spyIndex].id;
+
+    const roles = [...location.roles];
+    for (let i = roles.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [roles[i], roles[j]] = [roles[j], roles[i]];
+    }
+
+    room.players.forEach((player, index) => {
+      const isSpy = index === spyIndex;
+      player.role = isSpy ? 'Spy' : roles[index % roles.length];
+
+      io.to(player.id).emit('game_started', {
+        location: isSpy ? '???' : location.name,
+        role: player.role,
+        isSpy,
+        gameLength: room.gameLength * 60,
+        allLocations: locations.map((item) => item.name),
+        startTime: room.startTime,
+      });
     });
 
-    socket.on('join_room', ({ roomId, playerName }) => {
-        const room = rooms.get(roomId);
-        if (!room) {
-            socket.emit('error', 'ไม่พบห้องนี้');
-            return;
+    clearRoomTimer(room);
+    room.timer = setTimeout(() => {
+      if (room.status !== 'playing') return;
+      room.status = 'voting';
+      room.votes = {};
+      io.to(room.id).emit('start_voting');
+    }, room.gameLength * 60 * 1000);
+
+    console.log(`Game started in room ${room.id} (${location.name})`);
+  });
+
+  socket.on('vote_player', ({ roomId, suspectId } = {}) => {
+    const room = rooms.get(normalizeRoomId(roomId));
+    if (!room || room.status !== 'voting') return emitError(socket, 'ยังไม่อยู่ในช่วงโหวต');
+
+    const voter = room.players.find((player) => player.id === socket.id && player.connected);
+    const suspect = room.players.find((player) => player.id === suspectId && player.connected);
+    if (!voter || !suspect) return emitError(socket, 'ผู้เล่นที่เลือกไม่อยู่ในห้องแล้ว');
+    if (voter.id === suspect.id) return emitError(socket, 'ไม่สามารถโหวตตัวเองได้');
+
+    room.votes[voter.id] = suspect.id;
+    socket.emit('vote_recorded');
+    maybeResolveVoting(room);
+  });
+
+  socket.on('spy_guess_location', ({ roomId, locationName } = {}) => {
+    const room = rooms.get(normalizeRoomId(roomId));
+    if (!room || !room.location) return emitError(socket, 'ไม่พบเกมนี้');
+    if (socket.id !== room.spyId) return emitError(socket, 'เฉพาะ Spy เท่านั้นที่ทายสถานที่ได้');
+    if (!['playing', 'guessing'].includes(room.status)) return emitError(socket, 'ตอนนี้ยังทายสถานที่ไม่ได้');
+
+    if (room.status === 'playing') {
+      const remainingTime = room.gameLength * 60 * 1000 - (Date.now() - room.startTime);
+      if (remainingTime > 61000) return emitError(socket, 'Spy ทายได้ในช่วง 1 นาทีสุดท้ายเท่านั้น');
+    }
+
+    const selectedLocation = locations.find((location) => location.name === locationName);
+    if (!selectedLocation) return emitError(socket, 'สถานที่ที่เลือกไม่ถูกต้อง');
+
+    if (selectedLocation.name === room.location.name) {
+      finishGame(room, 'spy', `Spy ทายถูก! สถานที่คือ ${room.location.name}`);
+    } else {
+      finishGame(room, 'citizens', `Spy ทายผิด (${selectedLocation.name}) — สถานที่จริงคือ ${room.location.name}`);
+    }
+  });
+
+  socket.on('reset_game', (roomId) => {
+    const room = rooms.get(normalizeRoomId(roomId));
+    if (!room) return;
+
+    const player = room.players.find((item) => item.id === socket.id);
+    if (!player?.isHost) return emitError(socket, 'เฉพาะหัวหน้าห้องเท่านั้นที่เริ่มรอบใหม่ได้');
+    if (room.status !== 'finished') return emitError(socket, 'ยังไม่สามารถเริ่มรอบใหม่ได้');
+
+    clearRoomTimer(room);
+    room.status = 'waiting';
+    room.location = null;
+    room.startTime = null;
+    room.votes = {};
+    room.spyId = null;
+    room.result = null;
+    room.players.forEach((item) => delete item.role);
+
+    io.to(room.id).emit('room_reset');
+    io.to(room.id).emit('player_update', getPublicPlayerList(room.players));
+  });
+
+  socket.on('leave_room', (roomId) => {
+    const normalizedRoomId = normalizeRoomId(roomId);
+    const room = rooms.get(normalizedRoomId);
+    if (!room) return;
+
+    const player = room.players.find((item) => item.id === socket.id);
+    if (!player) return;
+
+    const wasSpy = room.spyId === player.id;
+    socket.leave(normalizedRoomId);
+    removePlayer(room, player);
+
+    if (room.players.length === 0) {
+      clearRoomTimer(room);
+      rooms.delete(normalizedRoomId);
+      return;
+    }
+
+    if (wasSpy && ['playing', 'voting', 'guessing'].includes(room.status)) {
+      finishGame(room, 'citizens', `Spy ออกจากห้อง — ชาวบ้านชนะ! สถานที่คือ ${room.location.name}`);
+      return;
+    }
+
+    io.to(normalizedRoomId).emit('player_update', getPublicPlayerList(room.players));
+    maybeResolveVoting(room);
+  });
+
+  socket.on('get_public_rooms', () => {
+    const publicRooms = [];
+    rooms.forEach((room) => {
+      if (!room.isPublic || room.status !== 'waiting') return;
+
+      ensureHost(room);
+      const connectedPlayers = getConnectedPlayers(room);
+      if (connectedPlayers.length === 0) return;
+
+      const host = connectedPlayers.find((player) => player.isHost);
+      publicRooms.push({
+        roomId: room.id,
+        hostName: host?.name || 'Unknown',
+        playerCount: connectedPlayers.length,
+        status: room.status,
+      });
+    });
+
+    socket.emit('public_rooms_list', publicRooms);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+
+    rooms.forEach((room, roomId) => {
+      const player = room.players.find((item) => item.id === socket.id);
+      if (!player) return;
+
+      player.connected = false;
+      ensureHost(room);
+      io.to(roomId).emit('player_update', getPublicPlayerList(room.players));
+      maybeResolveVoting(room);
+
+      player.disconnectTimeout = setTimeout(() => {
+        const currentPlayer = room.players.find((item) => item === player);
+        if (!currentPlayer || currentPlayer.connected) return;
+
+        const wasSpy = room.spyId === currentPlayer.id;
+        removePlayer(room, currentPlayer);
+
+        if (room.players.length === 0) {
+          clearRoomTimer(room);
+          rooms.delete(roomId);
+          return;
         }
 
-        // Check for reconnection
-        const existingPlayer = room.players.find(p => p.name === playerName);
-        if (existingPlayer) {
-            // Allow reconnection / session reclamation even if "connected" is true.
-            // This handles cases where the user switches apps/tabs and the old socket hasn't timed out yet.
-
-            // if (existingPlayer.connected) {
-            //     socket.emit('error', 'ชื่อนี้มีคนใช้แล้วในห้องนี้');
-            //     return;
-            // }
-
-            // Reconnect logic
-            console.log(`Player ${playerName} reconnecting to room ${roomId}`);
-
-            // Update spyId if necessary
-            if (room.spyId === existingPlayer.id) {
-                room.spyId = socket.id;
-            }
-
-            // Update votes (both from the player and against the player)
-            // 1. Update votes cast BY this player
-            if (room.votes[existingPlayer.id]) {
-                room.votes[socket.id] = room.votes[existingPlayer.id];
-                delete room.votes[existingPlayer.id];
-            }
-            // 2. Update votes cast AGAINST this player
-            for (const [voterId, suspectId] of Object.entries(room.votes)) {
-                if (suspectId === existingPlayer.id) {
-                    room.votes[voterId] = socket.id;
-                }
-            }
-
-            existingPlayer.id = socket.id;
-            existingPlayer.connected = true;
-            if (existingPlayer.disconnectTimeout) {
-                clearTimeout(existingPlayer.disconnectTimeout);
-                delete existingPlayer.disconnectTimeout;
-            }
-
-            socket.join(roomId);
-
-            // Send current state
-            socket.emit('room_joined', {
-                roomId,
-                players: getPublicPlayerList(room.players),
-                isHost: existingPlayer.isHost,
-                gameLength: room.gameLength,
-                isPublic: room.isPublic,
-                // If game is in progress, send game data
-                gameState: room.status === 'waiting' ? null : {
-                    status: room.status,
-                    location: (existingPlayer.id === room.spyId) ? '???' : room.location?.name,
-                    role: existingPlayer.role,
-                    isSpy: existingPlayer.id === room.spyId,
-                    startTime: room.startTime,
-                    gameLength: room.gameLength * 60,
-                    remainingTime: room.startTime ? Math.max(0, Math.floor((room.gameLength * 60) - ((Date.now() - room.startTime) / 1000))) : room.gameLength * 60,
-                    allLocations: locations.map(l => l.name)
-                }
-            });
-
-            // If game is running, we need to re-send game_started data properly.
-            if (room.status !== 'waiting') {
-                // We don't need to emit game_started here because room_joined already contains gameState
-                // and emitting it again might reset client state (like timer).
-
-                if (room.status === 'voting') socket.emit('start_voting');
-                if (room.status === 'guessing') socket.emit('spy_guess_phase');
-            }
-
-            io.to(roomId).emit('player_update', getPublicPlayerList(room.players));
-            return;
+        if (wasSpy && room.status === 'guessing') {
+          finishGame(room, 'citizens', `Spy ไม่กลับเข้าห้อง — ชาวบ้านชนะ! สถานที่คือ ${room.location.name}`);
+          return;
         }
-
-        if (room.status === 'playing') {
-            socket.emit('error', 'เกมเริ่มไปแล้ว');
-            return;
-        }
-
-        room.players.push({ id: socket.id, name: playerName, isHost: false, connected: true });
-        socket.join(roomId);
 
         io.to(roomId).emit('player_update', getPublicPlayerList(room.players));
-        socket.emit('room_joined', {
-            roomId,
-            players: getPublicPlayerList(room.players),
-            isHost: false,
-            gameLength: room.gameLength,
-            isPublic: room.isPublic
-        });
-        console.log(`${playerName} joined room ${roomId}`);
+        maybeResolveVoting(room);
+      }, RECONNECT_GRACE_MS);
     });
-
-    socket.on('update_game_settings', ({ roomId, gameLength, isPublic }) => {
-        const room = rooms.get(roomId);
-        if (!room) return;
-        const player = room.players.find(p => p.id === socket.id);
-        if (!player || !player.isHost) return;
-
-        if (gameLength) room.gameLength = gameLength;
-        if (typeof isPublic === 'boolean') room.isPublic = isPublic;
-
-        io.to(roomId).emit('game_settings_updated', {
-            gameLength: room.gameLength,
-            isPublic: room.isPublic
-        });
-    });
-
-    socket.on('start_game', (roomId) => {
-        const room = rooms.get(roomId);
-        if (!room) return;
-
-        const location = locations[Math.floor(Math.random() * locations.length)];
-        room.location = location;
-        room.status = 'playing';
-        room.startTime = Date.now();
-        room.votes = {};
-
-        const spyIndex = Math.floor(Math.random() * room.players.length);
-        const spyPlayer = room.players[spyIndex];
-        room.spyId = spyPlayer.id;
-
-        const roles = [...location.roles];
-        for (let i = roles.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [roles[i], roles[j]] = [roles[j], roles[i]];
-        }
-
-        room.players.forEach((player, index) => {
-            const isSpy = index === spyIndex;
-            const role = isSpy ? 'Spy' : roles[index % roles.length];
-
-            // Store role for reconnection
-            player.role = role;
-
-            io.to(player.id).emit('game_started', {
-                location: isSpy ? '???' : location.name,
-                role: role,
-                isSpy: isSpy,
-                gameLength: room.gameLength * 60,
-                allLocations: locations.map(l => l.name),
-                startTime: room.startTime
-            });
-        });
-
-        if (room.timer) clearTimeout(room.timer);
-        room.timer = setTimeout(() => {
-            io.to(roomId).emit('start_voting');
-            room.status = 'voting';
-        }, room.gameLength * 60 * 1000);
-
-        console.log(`Game started in room ${roomId}`);
-    });
-
-    socket.on('vote_player', ({ roomId, suspectId }) => {
-        const room = rooms.get(roomId);
-        if (!room || room.status !== 'voting') return;
-
-        room.votes[socket.id] = suspectId;
-
-        const connectedPlayers = room.players.filter(p => p.connected);
-
-        if (Object.keys(room.votes).length >= connectedPlayers.length) {
-            const voteCounts = {};
-            Object.values(room.votes).forEach(id => {
-                voteCounts[id] = (voteCounts[id] || 0) + 1;
-            });
-
-            let maxVotes = 0;
-            let suspectId = null;
-            for (const [id, count] of Object.entries(voteCounts)) {
-                if (count > maxVotes) {
-                    maxVotes = count;
-                    suspectId = id;
-                }
-            }
-
-            if (suspectId === room.spyId) {
-                io.to(roomId).emit('spy_guess_phase');
-                room.status = 'guessing';
-            } else {
-                io.to(roomId).emit('game_over', { winner: 'spy', reason: 'Citizens voted for the wrong person!' });
-                room.status = 'finished';
-            }
-        }
-    });
-
-    socket.on('spy_guess_location', ({ roomId, locationName }) => {
-        const room = rooms.get(roomId);
-        if (!room) return;
-
-        if (socket.id !== room.spyId) return;
-
-        // Check time restriction if status is 'playing' (active guess)
-        if (room.status === 'playing') {
-            const elapsedTime = Date.now() - room.startTime;
-            const totalTime = room.gameLength * 60 * 1000;
-            const remainingTime = totalTime - elapsedTime;
-
-            // Allow guess only if remaining time <= 60 seconds (plus a small buffer)
-            if (remainingTime > 61000) {
-                socket.emit('error', 'Spy can only guess in the last 1 minute!');
-                return;
-            }
-        }
-
-        if (locationName === room.location.name) {
-            io.to(roomId).emit('game_over', { winner: 'spy', reason: 'Spy guessed the location correctly!' });
-        } else {
-            io.to(roomId).emit('game_over', { winner: 'citizens', reason: `Spy guessed wrong! Location was ${room.location.name}` });
-        }
-        room.status = 'finished';
-        if (room.timer) clearTimeout(room.timer);
-    });
-
-    socket.on('reset_game', (roomId) => {
-        const room = rooms.get(roomId);
-        if (!room) return;
-
-        const player = room.players.find(p => p.id === socket.id);
-        if (!player || !player.isHost) return;
-
-        room.status = 'waiting';
-        room.location = null;
-        room.startTime = null;
-        room.votes = {};
-        room.spyId = null;
-        if (room.timer) clearTimeout(room.timer);
-
-        // Clear roles
-        room.players.forEach(p => delete p.role);
-
-        io.to(roomId).emit('room_reset');
-        io.to(roomId).emit('player_update', getPublicPlayerList(room.players));
-    });
-
-    socket.on('get_public_rooms', () => {
-        const publicRooms = [];
-        rooms.forEach((room) => {
-            if (room.isPublic && room.status === 'waiting') {
-                const host = room.players.find(p => p.isHost);
-                publicRooms.push({
-                    roomId: room.id,
-                    hostName: host ? host.name : 'Unknown',
-                    playerCount: room.players.length,
-                    status: room.status
-                });
-            }
-        });
-        socket.emit('public_rooms_list', publicRooms);
-    });
-
-    socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        rooms.forEach((room, roomId) => {
-            const player = room.players.find(p => p.id === socket.id);
-            if (player) {
-                player.connected = false;
-
-                // Set timeout to remove player after 2 minutes
-                player.disconnectTimeout = setTimeout(() => {
-                    const index = room.players.indexOf(player);
-                    if (index !== -1) {
-                        room.players.splice(index, 1);
-                        if (room.players.length === 0) {
-                            if (room.timer) clearTimeout(room.timer);
-                            rooms.delete(roomId);
-                        } else {
-                            io.to(roomId).emit('player_update', getPublicPlayerList(room.players));
-                        }
-                    }
-                }, 2 * 60 * 1000); // 2 minutes
-
-                io.to(roomId).emit('player_update', getPublicPlayerList(room.players));
-            }
-        });
-    });
+  });
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT} with ${locations.length} locations`);
 });
